@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>523</string>
+	<key>AMApplicationVersion</key>
+	<string>2.10</string>
+	<key>AMDocumentVersion</key>
+	<integer>2</integer>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<false/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.path</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>2.0.3</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMCategory</key>
+				<string>AMCategoryUtilities</string>
+				<key>AMIconName</key>
+				<string>Automator</string>
+				<key>AMKeywords</key>
+				<array>
+					<string>Shell</string>
+					<string>Script</string>
+				</array>
+				<key>AMName</key>
+				<string>Run Shell Script</string>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.cocoa.string</string>
+					</array>
+				</dict>
+				<key>AMRequiredResources</key>
+				<array/>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run Shell Script.action</string>
+				<key>ActionName</key>
+				<string>Run Shell Script</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>COMMAND_STRING</key>
+					<string>export PATH="/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$PATH"
+
+SCRIPT_DIR="$HOME/Desktop/Code/service-manual-reader"
+OUTPUT_DIR="$HOME/Claude-Manuals"
+
+for f in "$@"; do
+    if [[ "$f" == *.pdf ]] || [[ "$f" == *.PDF ]]; then
+        python3 "$SCRIPT_DIR/convert.py" "$f" --output-dir "$OUTPUT_DIR"
+    fi
+done
+
+osascript -e 'display notification "Manual extracted to ~/Claude-Manuals/" with title "Extract for Claude" sound name "Glass"'</string>
+					<key>CheckedForUserDefaultShell</key>
+					<true/>
+					<key>inputMethod</key>
+					<integer>1</integer>
+					<key>shell</key>
+					<string>/bin/zsh</string>
+					<key>source</key>
+					<string></string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.RunShellScript</string>
+				<key>CFBundleVersion</key>
+				<string>2.0.3</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>CategorySignature</key>
+				<string>ToyS</string>
+				<key>CreatedModuleVersion</key>
+				<string>2.0.3</string>
+				<key>IconName</key>
+				<string>Automator</string>
+				<key>Keywords</key>
+				<array>
+					<string>Shell</string>
+					<string>Script</string>
+				</array>
+				<key>ModuleName</key>
+				<string>Run Shell Script</string>
+				<key>NotificationReceivedHandlerName</key>
+				<string></string>
+			</dict>
+			<key>isViewVisible</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict/>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
