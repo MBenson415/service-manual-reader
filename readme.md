@@ -60,7 +60,6 @@ pip3 install PyMuPDF
 ```
 
 **MCP server** (requires [uv](https://astral.sh/uv)):
-```bash
 cd mcp-server && uv sync
 ```
 
