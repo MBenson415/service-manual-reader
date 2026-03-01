@@ -42,10 +42,18 @@ with open('$CLAUDE_CONFIG') as f:
     config = json.load(f)
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
-config['mcpServers']['service-manual-reader'] = {
+env_block = {}
+import os
+api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+if api_key:
+    env_block['ANTHROPIC_API_KEY'] = api_key
+server_config = {
     'command': '$UV_PATH',
     'args': ['--directory', '$SCRIPT_DIR/mcp-server', 'run', 'main.py']
 }
+if env_block:
+    server_config['env'] = env_block
+config['mcpServers']['service-manual-reader'] = server_config
 with open('$CLAUDE_CONFIG', 'w') as f:
     json.dump(config, f, indent=2)
 print('  ✓ MCP server added to Claude Desktop config')

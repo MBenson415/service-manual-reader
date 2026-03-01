@@ -8,6 +8,8 @@ Produces:
 """
 
 import argparse
+import base64
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -29,9 +31,22 @@ def slugify(text: str) -> str:
 
 
 def extract_assembly_code(title: str) -> Optional[str]:
-    """Extract assembly/board code like AWH-046 from a section title."""
-    m = re.search(r"\(([A-Z]{2,4}-\d{2,4})\)", title)
-    return m.group(1) if m else None
+    """Extract assembly/board code from a section title.
+
+    Handles multiple formats:
+      (AWH-046)          — Pioneer style
+      (PCB 19-1360)      — Proton / generic PCB style
+      (PCB-19-1361)      — variant with dash
+    """
+    # Try parenthesized codes first
+    m = re.search(r"\(([A-Z]{2,4}[\s-]\d{2,5}(?:-\d{1,5})?)\)", title)
+    if m:
+        return m.group(1).strip()
+    # Try unparenthesized "PCB NN-NNNN" anywhere in the title
+    m = re.search(r"\b(PCB[\s-]\d{2,5}(?:-\d{1,5})?)\b", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().upper()
+    return None
 
 
 def find_watermarks(doc: fitz.Document) -> set:
@@ -199,6 +214,205 @@ def sections_fallback(doc: fitz.Document, watermarks: set, chunk: int = 30) -> l
             "pages": pages,
             "text_parts": text_parts,
         })
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Vision-based section detection (for scanned / image-only PDFs)
+# ---------------------------------------------------------------------------
+
+VISION_MODEL = "claude-haiku-4-5-20251001"
+VISION_BATCH = 4          # pages per API call
+VISION_DPI   = 120        # lower DPI for efficient API transfer
+SPARSE_THRESHOLD = 0.80   # trigger vision when >= this fraction are image pages
+
+
+def _is_sparse_text(page_classes: list) -> bool:
+    """True when 80%+ of pages have no extractable text layer."""
+    if not page_classes:
+        return True
+    return page_classes.count("image") / len(page_classes) >= SPARSE_THRESHOLD
+
+
+VISION_MAX_PX = 3000      # cap longest side to stay well under API 8000px limit
+
+
+def _render_page_jpeg(doc: fitz.Document, page_num: int) -> bytes:
+    """Render a page to compressed grayscale JPEG for API transfer.
+
+    Automatically scales oversized pages so the longest side never
+    exceeds VISION_MAX_PX, keeping the image under API size limits.
+    """
+    page = doc[page_num]
+    # Calculate zoom: start from VISION_DPI, then cap to max pixel limit
+    zoom = VISION_DPI / 72
+    width_px = page.rect.width * zoom
+    height_px = page.rect.height * zoom
+    longest = max(width_px, height_px)
+    if longest > VISION_MAX_PX:
+        zoom = zoom * (VISION_MAX_PX / longest)
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+    return pix.tobytes(output="jpeg", jpg_quality=70)
+
+
+_VISION_PROMPT = (
+    "These are pages from an electronics service manual. "
+    "For each page, return a JSON array with one object per page in order. "
+    "Each object MUST have exactly these keys:\n"
+    '  "title": the assembly or section name printed on the page '
+    '(e.g. "Power Amplifier Assembly", "Parts List of Tone Control"); empty string if unclear\n'
+    '  "assembly_code": board code visible in a title block or schematic border, '
+    'format like "AWH-046" or "AWR-099"; empty string if none visible\n'
+    '  "section_type": one of "schematic", "parts-list", "adjustment", '
+    '"specs", "exploded-view", "general"\n'
+    '  "starts_new_section": true if this page starts a new assembly/section, '
+    'false if it continues the previous page\n'
+    "Respond with ONLY the JSON array — no markdown, no extra text."
+)
+
+
+def _call_vision_api(client, page_jpegs: list, page_offset: int) -> list:
+    """Send a batch of JPEG bytes to Claude and return per-page metadata dicts."""
+    import json
+
+    content = []
+    for i, jpeg_bytes in enumerate(page_jpegs):
+        content.append({"type": "text", "text": "Page {}:".format(page_offset + i + 1)})
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": base64.standard_b64encode(jpeg_bytes).decode("ascii"),
+            },
+        })
+    content.append({"type": "text", "text": _VISION_PROMPT})
+
+    response = client.messages.create(
+        model=VISION_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    raw = response.content[0].text.strip()
+    m = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not m:
+        return _blank_vision_results(len(page_jpegs))
+    try:
+        results = json.loads(m.group())
+        while len(results) < len(page_jpegs):
+            results.append(_blank_vision_entry(False))
+        return results[: len(page_jpegs)]
+    except (json.JSONDecodeError, ValueError):
+        return _blank_vision_results(len(page_jpegs))
+
+
+def _blank_vision_entry(starts_new: bool) -> dict:
+    return {"title": "", "assembly_code": "", "section_type": "general", "starts_new_section": starts_new}
+
+
+def _blank_vision_results(n: int) -> list:
+    return [_blank_vision_entry(i == 0) for i in range(n)]
+
+
+def _build_sections_from_vision_metadata(
+    metadata: list, doc: fitz.Document, watermarks: set,
+) -> list:
+    """Convert per-page vision metadata into section dicts matching the standard format."""
+    sections = []
+    current = None
+
+    for page_num, meta in enumerate(metadata):
+        page_text = get_page_text(doc, page_num, watermarks)
+        vis_title = meta.get("title", "").strip()
+        asm_code = meta.get("assembly_code", "").strip().upper()
+
+        # Build a clean title combining vision title and assembly code
+        if vis_title and asm_code and asm_code not in vis_title.upper():
+            full_title = "{} ({})".format(vis_title, asm_code)
+        elif vis_title:
+            full_title = vis_title
+        elif asm_code:
+            full_title = "Assembly {}".format(asm_code)
+        else:
+            full_title = "Page {}".format(page_num + 1)
+
+        starts_new = meta.get("starts_new_section", False) or current is None
+
+        # Force a new section when the assembly code changes
+        if current is not None and not starts_new:
+            prev_asm = current.get("_asm_code", "")
+            if prev_asm and asm_code and prev_asm != asm_code:
+                starts_new = True
+
+        if starts_new:
+            if current:
+                sections.append(current)
+            current = {
+                "title": full_title,
+                "start_page": page_num,
+                "pages": {page_num},
+                "text_parts": [(page_num, page_text)],
+                "_asm_code": asm_code,
+                "vision_type": meta.get("section_type") or "general",
+            }
+        else:
+            if current:
+                current["pages"].add(page_num)
+                current["text_parts"].append((page_num, page_text))
+
+    if current:
+        sections.append(current)
+
+    return sections
+
+
+def sections_from_vision(doc: fitz.Document, watermarks: set) -> list:
+    """Use Claude vision API to identify sections in image-only PDFs.
+
+    Requires ANTHROPIC_API_KEY environment variable.
+    Returns sections in the same format as other detection methods.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  ANTHROPIC_API_KEY not set — skipping vision analysis.")
+        return []
+
+    try:
+        import anthropic
+    except ImportError:
+        print("  'anthropic' package not installed — skipping vision analysis.")
+        print("  Install with: pip install anthropic")
+        return []
+
+    client = anthropic.Anthropic(api_key=api_key)
+    total = doc.page_count
+    print("  Analyzing {} pages in batches of {} (model: {})...".format(
+        total, VISION_BATCH, VISION_MODEL,
+    ))
+
+    all_metadata: list = []
+    for batch_start in range(0, total, VISION_BATCH):
+        batch_end = min(batch_start + VISION_BATCH, total)
+        page_jpegs = [_render_page_jpeg(doc, p) for p in range(batch_start, batch_end)]
+        try:
+            batch_meta = _call_vision_api(client, page_jpegs, batch_start)
+        except Exception as exc:
+            print("    Warning: API error pages {}-{}: {}".format(batch_start + 1, batch_end, exc))
+            batch_meta = _blank_vision_results(batch_end - batch_start)
+        all_metadata.extend(batch_meta)
+        print("  Pages {}/{} analysed".format(min(batch_end, total), total), end="\r", flush=True)
+
+    print()  # newline after progress line
+
+    sections = _build_sections_from_vision_metadata(all_metadata, doc, watermarks)
+
+    # Report unique assemblies found
+    assemblies = {s["_asm_code"] for s in sections if s.get("_asm_code")}
+    if assemblies:
+        print("  Assemblies identified: {}".format(", ".join(sorted(assemblies))))
+
     return sections
 
 
@@ -373,7 +587,7 @@ def write_section(
     title = section["title"]
     slug = slugify(title) or "section-{}".format(index)
     filename = "{:02d}-{}.md".format(index, slug)
-    assembly = extract_assembly_code(title)
+    assembly = extract_assembly_code(title) or section.get("_asm_code") or None
 
     pages = sorted(section["pages"])
     if not pages:
@@ -557,6 +771,14 @@ def convert_pdf(pdf_path: str, output_dir: Optional[str] = None):
             sections = sections_from_fonts(doc, watermarks)
             if sections:
                 print("Sections from font analysis: {}".format(len(sections)))
+            elif _is_sparse_text(page_classes):
+                print("Image-only PDF detected — attempting vision analysis...")
+                sections = sections_from_vision(doc, watermarks)
+                if sections:
+                    print("Sections from vision analysis: {}".format(len(sections)))
+                else:
+                    print("Vision analysis unavailable/failed, using page-based split...")
+                    sections = sections_fallback(doc, watermarks)
             else:
                 print("No sections detected, using page-based split...")
                 sections = sections_fallback(doc, watermarks)
@@ -564,7 +786,8 @@ def convert_pdf(pdf_path: str, output_dir: Optional[str] = None):
     # Classify and write sections
     section_info = []
     for i, section in enumerate(sections, start=1):
-        stype = classify_section(section["title"])
+        # Prefer the section_type assigned by vision analysis when available
+        stype = section.get("vision_type") or classify_section(section["title"])
         info = write_section(section, i, out, page_classes, doc, stype)
         section_info.append(info)
         fname, title, pr, stype, asm, imgs = info
