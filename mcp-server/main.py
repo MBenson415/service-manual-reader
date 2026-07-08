@@ -3,7 +3,9 @@
 Tools:
   - extract_manual: Convert a local PDF to structured markdown + images
   - list_manuals: List already-extracted manuals
+    - list_downloads: List downloaded PDFs in the Schematics directory
   - search_service_manual: Search the web for a service manual PDF
+    - download_service_manual: Download a manual PDF from a direct URL
   - read_index: Read a manual's _index.md (TOC, metadata, cross-reference)
   - read_section: Read a section's markdown + inline schematic images
   - get_schematic: Get all schematic images + parts list for a board assembly
@@ -18,6 +20,8 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
+from urllib.parse import unquote, urlparse
 from io import BytesIO
 from pathlib import Path
 
@@ -32,9 +36,19 @@ from PIL import Image as PILImage
 # ---------------------------------------------------------------------------
 
 MANUALS_DIR = Path.home() / "Claude-Manuals"
+SCHEMATICS_DIR = Path("/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics")
 CONVERT_SCRIPT = Path(__file__).resolve().parent.parent / "convert.py"
 
 mcp = FastMCP("service-manual-reader")
+
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    )
+}
+
+_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200MB cap for safety
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +178,59 @@ def _resolve_schematic_image(manual_name: str, board_id: str, page: int) -> tupl
     return img_path, ""
 
 
+def _safe_filename(board_id: str) -> str:
+    """Convert a board ID to a filesystem-safe filename (no extension).
+
+    Matches the sanitisation in Swift CircuitCacheService.safeFilename(for:).
+    IDs like 'HT3035:B / 25C335B' become 'HT3035-B-25C335B'.
+    """
+    safe = board_id
+    for ch in "/:\\ ":
+        safe = safe.replace(ch, "-")
+    while "--" in safe:
+        safe = safe.replace("--", "-")
+    safe = safe.strip("-")
+    return safe if safe else "unknown"
+
+
+def _sanitize_name(text: str) -> str:
+    """Make user/input-derived strings safe for folder/file names."""
+    cleaned = text.strip()
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" .")
+
+
+def _guess_download_filename(url: str, brand: str, model: str, filename: str) -> str:
+    """Choose a safe PDF filename for a downloaded manual."""
+    if filename.strip():
+        base = _sanitize_name(filename)
+    else:
+        path_name = Path(unquote(urlparse(url).path)).name
+        if path_name.lower().endswith(".pdf"):
+            base = _sanitize_name(path_name)
+        elif brand.strip() or model.strip():
+            base = _sanitize_name("{} {} Service Manual.pdf".format(brand.strip(), model.strip()))
+        else:
+            base = "service-manual.pdf"
+
+    if not base.lower().endswith(".pdf"):
+        base += ".pdf"
+    return base
+
+
 def _load_circuit_json(manual_dir: Path, board_id: str) -> dict | None:
     """Load _circuits/<board_id>.json if it exists."""
     circuits_dir = manual_dir / "_circuits"
     if not circuits_dir.is_dir():
         return None
-    # Try exact match first, then case-insensitive
-    target = circuits_dir / "{}.json".format(board_id.upper())
+    # Try sanitised filename first, then case-insensitive scan
+    safe = _safe_filename(board_id.upper())
+    target = circuits_dir / "{}.json".format(safe)
     if target.exists():
         return json.loads(target.read_text(encoding="utf-8"))
     for f in circuits_dir.glob("*.json"):
-        if f.stem.upper() == board_id.upper():
+        if f.stem.upper() == board_id.upper() or f.stem.upper() == safe.upper():
             return json.loads(f.read_text(encoding="utf-8"))
     return None
 
@@ -270,6 +326,109 @@ def list_manuals() -> str:
         return "No extracted manuals found in {}".format(MANUALS_DIR)
 
     return "Extracted manuals:\n" + "\n".join(manuals)
+
+
+@mcp.tool()
+def download_service_manual(url: str, brand: str = "", model: str = "", filename: str = "") -> str:
+    """Download a service manual PDF from a direct URL.
+
+    Saves the file to /Users/marshallbenson/Desktop/Benchmark Audio Repair/
+    Schematics/<Brand Model>/ and verifies that the downloaded content is
+    actually a PDF before keeping it.
+
+    Args:
+        url: Direct URL to a PDF file.
+        brand: Optional manufacturer name (used for default filename).
+        model: Optional model number (used for default filename).
+        filename: Optional explicit output filename.
+    """
+    if not re.match(r"^https?://", url.strip(), re.IGNORECASE):
+        return "Error: URL must start with http:// or https://"
+
+    if not brand.strip() or not model.strip():
+        return "Error: Both brand and model are required. Folder format is '<Brand> <Model>'."
+
+    SCHEMATICS_DIR.mkdir(parents=True, exist_ok=True)
+
+    folder_name = _sanitize_name("{} {}".format(brand.strip(), model.strip()))
+    target_folder = SCHEMATICS_DIR / folder_name
+    target_folder.mkdir(parents=True, exist_ok=True)
+
+    output_name = _guess_download_filename(url, brand, model, filename)
+    dest = target_folder / output_name
+
+    if dest.exists():
+        return "Already exists, not overwriting: {}".format(dest)
+
+    total = 0
+    try:
+        with httpx.Client(follow_redirects=True, timeout=60.0, headers=_DOWNLOAD_HEADERS) as client:
+            with client.stream("GET", url) as response:
+                if response.status_code >= 400:
+                    return "Download failed: HTTP {}".format(response.status_code)
+
+                content_type = response.headers.get("Content-Type", "")
+
+                first_chunk = b""
+                stream = response.iter_bytes(chunk_size=262_144)
+                for chunk in stream:
+                    first_chunk = chunk
+                    break
+
+                if not first_chunk:
+                    return "Download failed: empty response body"
+
+                # Require PDF magic bytes in first chunk to avoid saving HTML/login pages.
+                if b"%PDF" not in first_chunk[:1024]:
+                    return (
+                        "Not a PDF (Content-Type: {}). The URL may be a landing page "
+                        "rather than a direct PDF link."
+                    ).format(content_type or "unknown")
+
+                with open(dest, "wb") as f:
+                    f.write(first_chunk)
+                    total += len(first_chunk)
+
+                    for chunk in stream:
+                        total += len(chunk)
+                        if total > _MAX_DOWNLOAD_BYTES:
+                            f.close()
+                            dest.unlink(missing_ok=True)
+                            return "Aborted: file exceeded {} MB cap.".format(_MAX_DOWNLOAD_BYTES // 1024 // 1024)
+                        f.write(chunk)
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        return "Download failed: {}: {}".format(type(exc).__name__, exc)
+
+    size_mb = total / 1024 / 1024
+    return (
+        "Saved {:.1f} MB to {}\n"
+        "Next step: run extract_manual(pdf_path='{}')"
+    ).format(size_mb, dest, dest)
+
+
+@mcp.tool()
+def list_downloads() -> str:
+    """List downloaded service manual PDFs in the Schematics directory."""
+    if not SCHEMATICS_DIR.exists():
+        return "Schematics directory not found yet. Use download_service_manual first."
+
+    pdfs = sorted(SCHEMATICS_DIR.glob("**/*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not pdfs:
+        return "No downloaded PDFs found in {}".format(SCHEMATICS_DIR)
+
+    lines = ["Downloaded PDFs:"]
+    for p in pdfs:
+        stat = p.stat()
+        size_mb = stat.st_size / 1024 / 1024
+        modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        try:
+            rel = p.relative_to(SCHEMATICS_DIR)
+        except ValueError:
+            rel = p
+        lines.append("- {} ({:.1f} MB, modified {})".format(rel, size_mb, modified))
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -806,6 +965,67 @@ def _parse_spice_lines(text: str) -> tuple[list[dict], set[str]]:
     return entries, netted
 
 
+def _spice_entries_to_standalone_json(entries: list[dict], board_id: str, manual_name: str) -> dict:
+    """Build a complete circuit JSON from SPICE entries alone (no pre-existing circuit data).
+
+    Creates component definitions from the SPICE entries and builds a net list.
+    """
+    # Infer component type from designator prefix
+    PREFIX_TYPE = {
+        "R": "resistor", "C": "capacitor", "L": "inductor",
+        "D": "diode", "Q": "transistor", "T": "transformer",
+        "F": "fuse", "VR": "potentiometer", "TR": "transformer",
+    }
+
+    # Build components and node map
+    components = {}
+    node_map: dict[str, list[tuple[str, str]]] = {}
+
+    for entry in entries:
+        bare = re.sub(r"^[QX]_", "", entry["designator"])
+        if bare not in components:
+            # Determine type from prefix
+            prefix = re.match(r"^[A-Z]+", bare)
+            comp_type = PREFIX_TYPE.get(prefix.group() if prefix else "", "component")
+            pin_ids = [str(i + 1) for i in range(len(entry["nodes"]))]
+            if comp_type == "transistor" and len(pin_ids) == 3:
+                pin_ids = ["C", "B", "E"]
+            components[bare] = {
+                "designator": bare,
+                "type": comp_type,
+                "value": entry.get("value", ""),
+                "pins": [{"id": p, "netID": ""} for p in pin_ids],
+            }
+
+        comp = components[bare]
+        pin_ids = [p["id"] for p in comp["pins"]]
+        for i, node_name in enumerate(entry["nodes"]):
+            pin_id = pin_ids[i] if i < len(pin_ids) else str(i + 1)
+            node_map.setdefault(node_name, []).append((bare, pin_id))
+            # Set netID on pin
+            if i < len(comp["pins"]):
+                comp["pins"][i]["netID"] = node_name
+
+    # Build nets
+    nets = []
+    for node_name, connections in sorted(node_map.items()):
+        nets.append({
+            "id": node_name,
+            "connectedPins": [
+                {"componentID": cid, "pinID": pid}
+                for cid, pid in connections
+            ],
+        })
+
+    return {
+        "name": "{} ({})".format(board_id, manual_name),
+        "description": "Auto-generated from schematic vision analysis",
+        "components": list(components.values()),
+        "nets": nets,
+        "functionalBlocks": [],
+    }
+
+
 def _spice_to_circuit_json(entries: list[dict], circuit_data: dict) -> dict:
     """Update a circuit JSON's nets array with vision-extracted SPICE data.
 
@@ -1119,10 +1339,15 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
     if not manual_dir:
         return "Manual '{}' not found. Use list_manuals to see available manuals.".format(manual_name)
 
+    def _progress(msg):
+        """Emit progress to stderr so the Swift app can display it."""
+        print(msg, file=sys.stderr, flush=True)
+
     client = anthropic.Anthropic(api_key=api_key)
     pass_log = []
 
     # --- Step 1: Gather context ---
+    _progress("Step 1/4: Loading circuit context for {}...".format(board_id))
     circuit_data = _load_circuit_json(manual_dir, board_id)
     theory_context = _build_theory_context(circuit_data) if circuit_data else ""
 
@@ -1131,6 +1356,9 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
     if circuit_data:
         for c in circuit_data.get("components", []):
             known_components.add(c["designator"].upper())
+        _progress("Found {} known components from circuit data".format(len(known_components)))
+    else:
+        _progress("No existing circuit data — will create from scratch")
 
     # Collect schematic images for this board
     board_id_upper = board_id.upper().strip()
@@ -1151,11 +1379,15 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
     if not schematic_images:
         return "No schematic images found for board '{}'. Check the board ID.".format(board_id)
 
+    _progress("Found {} schematic image(s) for {}".format(len(schematic_images), board_id))
+
     # --- Pass 1: Full image netlist extraction ---
+    _progress("Step 2/4: Pass 1 — analyzing full schematic image(s)...")
     all_entries = []
     netted_designators = set()
 
-    for sch_path in schematic_images:
+    for i, sch_path in enumerate(schematic_images):
+        _progress("Pass 1: Analyzing image {}/{} ({})...".format(i + 1, len(schematic_images), sch_path.name))
         try:
             img_data, _, _ = _image_to_base64(sch_path)
         except Exception:
@@ -1166,27 +1398,35 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
             result = _vision_call(client, [(img_data, "image/jpeg")], prompt, max_tokens=4096)
         except Exception as exc:
             pass_log.append("Pass 1: Vision error on {}: {}".format(sch_path.name, exc))
+            _progress("Pass 1: Vision error on {}: {}".format(sch_path.name, exc))
             continue
 
         entries, netted = _parse_spice_lines(result)
         all_entries.extend(entries)
         netted_designators |= netted
+        _progress("Pass 1: Found {} connections so far".format(len(all_entries)))
 
     coverage = _compute_coverage(known_components, netted_designators) if known_components else 0
     still_missing = known_components - netted_designators if known_components else set()
-    pass_log.append("Pass 1 (full image): netted {}/{} components, coverage {:.0f}%".format(
+    pass1_msg = "Pass 1 (full image): netted {}/{} components, coverage {:.0f}%".format(
         len(known_components & netted_designators) if known_components else len(netted_designators),
         len(known_components) if known_components else "?",
         coverage,
-    ))
+    )
+    pass_log.append(pass1_msg)
+    _progress(pass1_msg)
 
     # --- Pass 2+: Progressive tile crop refinement ---
-    for grid in CROP_GRIDS:
+    _progress("Step 3/4: Tile refinement passes ({} missing)...".format(len(still_missing)))
+    for grid_idx, grid in enumerate(CROP_GRIDS):
         if coverage >= COVERAGE_TARGET or not still_missing:
+            _progress("Coverage target met or no missing components — skipping tile passes")
             break
 
         newly_found = set()
         grid_label = "{}x{}".format(grid[0], grid[1])
+        _progress("Pass {} ({} crop): scanning for {} missing components...".format(
+            grid_idx + 2, grid_label, len(still_missing)))
 
         for sch_path in schematic_images:
             try:
@@ -1194,10 +1434,12 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
             except Exception:
                 continue
 
-            for tile_data in tiles:
+            for tile_idx, tile_data in enumerate(tiles):
                 if not still_missing:
                     break
 
+                _progress("Pass {} tile {}/{}: {} still missing...".format(
+                    grid_idx + 2, tile_idx + 1, len(tiles), len(still_missing)))
                 prompt = _TARGETED_NET_PROMPT.format(
                     "\n".join(sorted(still_missing)),
                 )
@@ -1216,28 +1458,37 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
                         newly_found.add(bare)
 
         coverage = _compute_coverage(known_components, netted_designators)
-        pass_log.append("Pass {} ({} crop): +{} new ({}), coverage {:.0f}%".format(
+        pass_msg = "Pass {} ({} crop): +{} new ({}), coverage {:.0f}%".format(
             len(pass_log) + 1, grid_label, len(newly_found),
             ", ".join(sorted(newly_found)) if newly_found else "none",
             coverage,
-        ))
+        )
+        pass_log.append(pass_msg)
+        _progress(pass_msg)
 
         if not newly_found:
             pass_log.append("No improvement — stopping crop passes.")
+            _progress("No improvement — stopping crop passes.")
             break
 
     # --- Save updated JSON ---
+    _progress("Step 4/4: Saving circuit JSON...")
     json_saved = False
-    if save_json and circuit_data and all_entries:
+    if save_json and all_entries:
         try:
-            updated = _spice_to_circuit_json(all_entries, circuit_data)
+            if circuit_data:
+                updated = _spice_to_circuit_json(all_entries, circuit_data)
+            else:
+                # No pre-existing circuit — build a minimal one from SPICE entries
+                updated = _spice_entries_to_standalone_json(all_entries, board_id, manual_dir.name)
             circuits_dir = manual_dir / "_circuits"
             circuits_dir.mkdir(exist_ok=True)
-            out_path = circuits_dir / "{}.json".format(board_id.upper())
+            out_path = circuits_dir / "{}.json".format(_safe_filename(board_id.upper()))
             out_path.write_text(json.dumps(updated, indent=2, ensure_ascii=False), encoding="utf-8")
             json_saved = True
-        except Exception:
-            pass
+            _progress("Saved circuit JSON: {}".format(out_path.name))
+        except Exception as exc:
+            _progress("Error saving JSON: {}".format(exc))
 
     # --- Build SPICE output ---
     spice_lines = ["* SPICE Netlist: {} ({})".format(board_id, manual_dir.name)]
@@ -1262,7 +1513,7 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
     report.append("- Components with connections traced: **{}**".format(len(netted_designators)))
     report.append("- Final coverage: **{:.0f}%**".format(coverage))
     if json_saved:
-        report.append("- Circuit JSON updated: `_circuits/{}.json`".format(board_id.upper()))
+        report.append("- Circuit JSON updated: `_circuits/{}.json`".format(_safe_filename(board_id.upper())))
     report.append("")
 
     if still_missing:

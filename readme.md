@@ -39,11 +39,13 @@ Given a service manual PDF, the converter produces:
 
 ## Claude Desktop (MCP)
 
-After install, Claude Desktop has three tools:
+After install, Claude Desktop has these manual-management tools:
 
 - **search_service_manual** — "Find me the Pioneer SX-750 service manual"
+- **download_service_manual** — "Download this direct PDF URL into a Brand+Model folder in Schematics"
 - **extract_manual** — "Extract the PDF at ~/Downloads/SX-750.pdf"
 - **list_manuals** — "What manuals do I have extracted?"
+- **list_downloads** — "Show all downloaded PDFs in Schematics"
 
 ## CLI Usage
 

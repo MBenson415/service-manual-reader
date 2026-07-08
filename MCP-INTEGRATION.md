@@ -40,6 +40,8 @@ process.launch()
 | `extract_manual` | `pdf_path: String` | Status message. Extracts PDF → `~/Claude-Manuals/<name>/` |
 | `list_manuals` | — | List of extracted manual names |
 | `search_service_manual` | `brand: String, model: String` | Web search results with download links |
+| `download_service_manual` | `url: String, brand: String = "", model: String = "", filename: String = ""` | Downloads PDF to `/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics/<Brand Model>/` and returns path for `extract_manual` |
+| `list_downloads` | — | Lists downloaded PDFs under the Schematics directory (with subfolder paths) |
 
 ### Reading
 
