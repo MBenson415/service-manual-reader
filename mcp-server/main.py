@@ -15,11 +15,13 @@ Tools:
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from urllib.parse import unquote, urlparse
 from io import BytesIO
@@ -35,9 +37,12 @@ from PIL import Image as PILImage
 # Config
 # ---------------------------------------------------------------------------
 
-MANUALS_DIR = Path.home() / "Claude-Manuals"
 SCHEMATICS_DIR = Path("/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics")
+MANUALS_DIR = SCHEMATICS_DIR
 CONVERT_SCRIPT = Path(__file__).resolve().parent.parent / "convert.py"
+
+sys.path.insert(0, str(CONVERT_SCRIPT.parent))
+from schematic_imaging import preprocess_image, preprocessing_enabled
 
 mcp = FastMCP("service-manual-reader")
 
@@ -277,7 +282,7 @@ def extract_manual(pdf_path: str) -> str:
 
     Converts the PDF into section-based markdown files with embedded PNG
     schematics, parts list tables, and an indexed table of contents.
-    Output goes to ~/Claude-Manuals/<manual-name>/.
+    Output goes to the Schematics directory under <manual-name>/.
 
     Args:
         pdf_path: Absolute path to the PDF file on disk.
@@ -306,7 +311,7 @@ def extract_manual(pdf_path: str) -> str:
 
 @mcp.tool()
 def list_manuals() -> str:
-    """List all previously extracted service manuals in ~/Claude-Manuals/.
+    """List all previously extracted service manuals in the Schematics directory.
 
     Returns the manual names and their _index.md paths so you can read them.
     """
@@ -598,7 +603,8 @@ def get_schematic(manual_name: str, board_id: str, page: int = 0) -> list:
     return result
 
 
-VISION_MODEL = "claude-haiku-4-5-20251001"
+VISION_MODEL = os.environ.get("SCHEMATIC_VISION_MODEL", "claude-haiku-4-5-20251001")
+HARD_VISION_MODEL = os.environ.get("SCHEMATIC_HARD_MODEL", "claude-sonnet-4-5-20250929")
 VISION_MAX_PX = 2000
 VISION_QUALITY = 85
 COVERAGE_TARGET = 95  # % coverage before we stop cropping
@@ -630,9 +636,10 @@ flag uncertainty. Keep the analysis concise and practical for a technician \
 doing repair work."""
 
 
-def _image_to_base64(img_path: Path) -> tuple[str, int, int]:
+def _image_to_base64(img_path: Path, enhance: bool = True) -> tuple[str, int, int]:
     """Load an image, resize for vision API, return (base64_data, width, height)."""
-    img = PILImage.open(img_path)
+    with PILImage.open(img_path) as source:
+        img = preprocess_image(source) if enhance else source.copy()
     if img.mode not in ("L", "RGB"):
         img = img.convert("RGB")
 
@@ -640,7 +647,7 @@ def _image_to_base64(img_path: Path) -> tuple[str, int, int]:
     if max(img.size) > VISION_MAX_PX:
         ratio = VISION_MAX_PX / max(img.size)
         img = img.resize(
-            (int(img.width * ratio), int(img.height * ratio)),
+            (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
             PILImage.LANCZOS,
         )
 
@@ -650,42 +657,136 @@ def _image_to_base64(img_path: Path) -> tuple[str, int, int]:
     return data, img.width, img.height
 
 
-def _crop_image_tiles(img_path: Path, grid: tuple[int, int]) -> list[tuple[str, str]]:
+def _tile_boxes(width: int, height: int, grid: tuple[int, int], overlap: float = 0.10) -> list[tuple]:
+    rows, cols = grid
+    if rows < 1 or cols < 1 or rows > height or cols > width:
+        raise ValueError("Grid must fit within the image dimensions")
+    if not 0 <= overlap < 1:
+        raise ValueError("Overlap must be between 0 and 1")
+    pad_x = round(width / cols * overlap / 2)
+    pad_y = round(height / rows * overlap / 2)
+    return [
+        (max(0, column * width // cols - pad_x), max(0, row * height // rows - pad_y),
+         min((column + 1) * width // cols + pad_x, width), min((row + 1) * height // rows + pad_y, height))
+        for row in range(rows) for column in range(cols)
+    ]
+
+
+def _crop_image_tiles(
+    img_path: Path, grid: tuple[int, int], overlap: float = 0.10,
+    enhance: bool = True,
+) -> list[tuple[str, str]]:
     """Split an image into tiles at full resolution for detailed scanning.
 
     Returns list of (base64_data, media_type) tuples, one per tile.
     Tiles are capped at VISION_MAX_PX per side for the API.
     """
-    img = PILImage.open(img_path)
+    with PILImage.open(img_path) as source:
+        img = source.copy()
     if img.mode not in ("L", "RGB"):
         img = img.convert("RGB")
 
-    rows, cols = grid
-    tile_w = img.width // cols
-    tile_h = img.height // rows
-
     tiles = []
-    for r in range(rows):
-        for c in range(cols):
-            left = c * tile_w
-            top = r * tile_h
-            right = min((c + 1) * tile_w, img.width)
-            bottom = min((r + 1) * tile_h, img.height)
-            tile = img.crop((left, top, right, bottom))
-
-            if max(tile.size) > VISION_MAX_PX:
-                ratio = VISION_MAX_PX / max(tile.size)
-                tile = tile.resize(
-                    (int(tile.width * ratio), int(tile.height * ratio)),
-                    PILImage.LANCZOS,
-                )
-
-            buf = BytesIO()
-            tile.save(buf, format="JPEG", quality=VISION_QUALITY)
-            data = base64.standard_b64encode(buf.getvalue()).decode("ascii")
-            tiles.append((data, "image/jpeg"))
+    for box in _tile_boxes(img.width, img.height, grid, overlap):
+        tile = img.crop(box)
+        if enhance:
+            tile = preprocess_image(tile)
+        if max(tile.size) > VISION_MAX_PX:
+            ratio = VISION_MAX_PX / max(tile.size)
+            tile = tile.resize(
+                (max(1, int(tile.width * ratio)), max(1, int(tile.height * ratio))),
+                PILImage.LANCZOS,
+            )
+        buf = BytesIO()
+        tile.save(buf, format="JPEG", quality=VISION_QUALITY)
+        data = base64.standard_b64encode(buf.getvalue()).decode("ascii")
+        tiles.append((data, "image/jpeg"))
 
     return tiles
+
+
+def _hard_call_budget() -> int:
+    try:
+        return max(0, min(20, int(os.environ.get("SCHEMATIC_MAX_HARD_CALLS", "4"))))
+    except ValueError:
+        return 4
+
+
+def _source_fingerprints(images: list[Path]) -> dict:
+    result = {}
+    for image in sorted(set(images)):
+        for path in (image, image.with_suffix(".text.json")):
+            result[path.name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+    return result
+
+
+def _reading_settings() -> dict:
+    return {"model": VISION_MODEL, "hardModel": HARD_VISION_MODEL, "preprocess": preprocessing_enabled()}
+
+
+def _cached_readings(circuit: dict | None, images: list[Path]) -> dict:
+    cache = (circuit or {}).get("schematicReadings", {})
+    if cache.get("version") != 1 or cache.get("settings") != _reading_settings():
+        return {}
+    if sorted(cache.get("schematicImages", [])) != sorted({path.name for path in images}):
+        return {}
+    sources = cache.get("sources", {})
+    if not images or not sources:
+        return {}
+    for name, expected in sources.items():
+        if Path(name).name != name:
+            return {}
+        path = images[0].parent / name
+        actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+        if actual != expected:
+            return {}
+    return cache
+
+
+def _save_circuit_json(manual_dir: Path, board_id: str, circuit: dict) -> Path:
+    directory = manual_dir / "_circuits"
+    directory.mkdir(exist_ok=True)
+    destination = directory / "{}.json".format(_safe_filename(board_id.upper()))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(circuit, stream, indent=2, ensure_ascii=False)
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _refinement_tiles(img_path: Path, grid: tuple[int, int], targets: set, readings: dict, hard: bool = False):
+    with PILImage.open(img_path) as source:
+        width, height = source.size
+    boxes = _tile_boxes(width, height, grid)
+    enhanced = _crop_image_tiles(img_path, grid)
+    original = _crop_image_tiles(img_path, grid, enhance=False) if hard else []
+    candidates = []
+    for index, (left, top, right, bottom) in enumerate(boxes):
+        box = [left / width, top / height, right / width, bottom / height]
+        score = 0
+        unknown_location = False
+        for target in targets:
+            locations = readings.get(target, {}).get("evidence", [])
+            if not locations:
+                unknown_location = True
+            for location in locations:
+                if location.get("image") != img_path.name:
+                    continue
+                bounds = location.get("bbox", [0, 0, 1, 1])
+                if bounds[0] < box[2] and bounds[2] > box[0] and bounds[1] < box[3] and bounds[3] > box[1]:
+                    score += 1
+        if score or unknown_location:
+            evidence = {"image": img_path.name, "bbox": box, "source": "vision",
+                        "model": HARD_VISION_MODEL if hard else VISION_MODEL}
+            images = [original[index], enhanced[index]] if hard else [enhanced[index]]
+            candidates.append((score, index, images, evidence))
+    for _, index, images, evidence in sorted(candidates, key=lambda candidate: -candidate[0]):
+        yield index, images, evidence
 
 
 _TARGETED_DESIGNATOR_PROMPT = """\
@@ -710,7 +811,7 @@ CRITICAL RULES FOR TRACING CONNECTIONS:
 - Follow each wire from a component pin to its destination node or junction.
 - Each pin of a 2-terminal component (resistor, capacitor) connects to a \
 DIFFERENT node. A resistor always bridges two distinct nets.
-- For transistors: collector, base, and emitter each connect to different nodes.
+- Read transistor pin identities from the symbol; never infer pin order from layout.
 - When a wire runs from one component pin to another component pin, both pins \
 share the SAME node name. This is how you build nets.
 - Look for labeled voltage rails (VCC, VEE, +33V, -33V, GND) and use those \
@@ -783,34 +884,20 @@ def analyze_schematic(manual_name: str, board_id: str, page: int) -> str:
 
     try:
         img_data, w, h = _image_to_base64(img_path)
+        original_data, _, _ = _image_to_base64(img_path, enhance=False)
     except Exception as exc:
         return "Error loading image {}: {}".format(img_path.name, exc)
 
     client = anthropic.Anthropic(api_key=api_key)
 
     try:
-        response = client.messages.create(
-            model=VISION_MODEL,
-            max_tokens=4096,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_data,
-                        },
-                    },
-                    {"type": "text", "text": _ANALYZE_PROMPT},
-                ],
-            }],
+        analysis = _vision_call(
+            client, [(original_data, "image/jpeg"), (img_data, "image/jpeg")],
+            _ANALYZE_PROMPT + _page_text_context(img_path)
+            + "\nImages show the same page: original first, enhanced second. Verify fine junctions against the original.",
         )
     except Exception as exc:
         return "Vision API error: {}".format(exc)
-
-    analysis = response.content[0].text
 
     header = "# Schematic Analysis: {} (board {}, page {})\n".format(
         img_path.name, board_id, page,
@@ -871,11 +958,16 @@ def _find_parts_list_images(manual_dir: Path) -> list[Path]:
     return images
 
 
-def _vision_call(client: anthropic.Anthropic, images: list[tuple[str, str]], prompt: str, max_tokens: int = 4096) -> str:
+def _vision_call(
+    client: anthropic.Anthropic | None, images: list[tuple[str, str]], prompt: str,
+    max_tokens: int = 4096, model: str | None = None,
+) -> str:
     """Make a vision API call with one or more images and a text prompt.
 
     images: list of (base64_data, media_type) tuples.
     """
+    if client is None:
+        raise ValueError("ANTHROPIC_API_KEY not set. Required for vision analysis.")
     content = []
     for data, media_type in images:
         content.append({
@@ -885,11 +977,13 @@ def _vision_call(client: anthropic.Anthropic, images: list[tuple[str, str]], pro
     content.append({"type": "text", "text": prompt})
 
     response = client.messages.create(
-        model=VISION_MODEL,
+        model=model or VISION_MODEL,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}],
     )
-    return response.content[0].text
+    if response.stop_reason == "max_tokens":
+        raise ValueError("Vision response was truncated; refusing incomplete results")
+    return "\n".join(block.text for block in response.content if block.type == "text")
 
 
 def _parse_designator_lines(text: str) -> tuple[set[str], set[str]]:
@@ -901,7 +995,7 @@ def _parse_designator_lines(text: str) -> tuple[set[str], set[str]]:
         if not line or line.startswith("#") or line.startswith("*") or "NONE_FOUND" in line:
             continue
         upper = line.upper()
-        if not re.match(r"^[A-Z]+\d", upper):
+        if not re.fullmatch(r"[A-Z]{1,4}[\d?][A-Z\d?]*", upper):
             continue
         if "?" in upper:
             uncertain.add(upper)
@@ -913,6 +1007,72 @@ def _parse_designator_lines(text: str) -> tuple[set[str], set[str]]:
 def _compute_coverage(parts: set, found: set) -> float:
     """Return coverage percentage."""
     return len(parts & found) / len(parts) * 100 if parts else 100.0
+
+
+def _page_words(img_path: Path) -> list[dict]:
+    try:
+        metadata = json.loads(img_path.with_suffix(".text.json").read_text(encoding="utf-8"))
+        if metadata.get("version") != 1:
+            return []
+        if metadata.get("image_sha256") != hashlib.sha256(img_path.read_bytes()).hexdigest():
+            return []
+        return metadata["words"] if isinstance(metadata.get("words"), list) else []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def _native_designators(img_path: Path) -> dict[str, list[dict]]:
+    evidence = {}
+    for word in _page_words(img_path):
+        designator = word.get("text", "").strip(".,:;()").upper()
+        if word.get("visible") and re.fullmatch(r"[A-Z]{1,4}\d[A-Z0-9]*", designator):
+            evidence.setdefault(designator, []).append({
+                "image": img_path.name, "bbox": word["bbox"], "source": "pdf-text",
+            })
+    return evidence
+
+
+def _page_text_context(img_path: Path) -> str:
+    words = _page_words(img_path)
+    if not words:
+        return ""
+    return "\nPDF text layer (may include faulty OCR; labels do not prove connections):\n" + " ".join(
+        word["text"] for word in words
+    )[:12000]
+
+
+def _board_schematic_images(manual_dir: Path, board_id: str) -> list[Path]:
+    images = []
+    for section in sorted(manual_dir.glob("*.md")):
+        if section.name == "_index.md" or re.search(r"parts.list", section.name, re.IGNORECASE):
+            continue
+        text = section.read_text(encoding="utf-8")
+        if board_id.upper().strip() in text.upper():
+            images.extend(manual_dir / name for name in _extract_image_refs(text) if (manual_dir / name).exists())
+    return list(dict.fromkeys(images))
+
+
+def _matches_uncertain(pattern: str, designator: str) -> bool:
+    return pattern == designator + "?" or re.fullmatch(re.escape(pattern).replace(r"\?", "."), designator) is not None
+
+
+def _record_readings(readings: dict, confirmed: set, uncertain: set, targets: set, evidence: dict):
+    for designator in confirmed:
+        entry = readings.setdefault(designator, {"status": "confirmed", "evidence": []})
+        entry["status"] = "confirmed"
+        if evidence not in entry["evidence"]:
+            entry["evidence"].append(evidence)
+    for designator in targets - confirmed:
+        candidates = sorted(pattern for pattern in uncertain if _matches_uncertain(pattern, designator))
+        if not candidates:
+            continue
+        entry = readings.setdefault(designator, {"status": "uncertain", "evidence": []})
+        if entry["status"] == "confirmed":
+            continue
+        entry["status"] = "uncertain"
+        entry["candidates"] = sorted(set(entry.get("candidates", [])) | set(candidates))
+        if evidence not in entry["evidence"]:
+            entry["evidence"].append(evidence)
 
 
 # SPICE netlist line patterns
@@ -947,7 +1107,8 @@ def _parse_spice_lines(text: str) -> tuple[list[dict], set[str]]:
             # Strip Q_ prefix to get bare designator for coverage tracking
             bare = re.sub(r"^Q_", "", desig)
             entries.append({"raw": line, "designator": desig, "nodes": nodes, "value": value})
-            netted.add(bare)
+            if "?" not in " ".join(nodes + [value]):
+                netted.add(bare)
             continue
 
         # Try 2-terminal: R807 node1 node2 820
@@ -959,10 +1120,49 @@ def _parse_spice_lines(text: str) -> tuple[list[dict], set[str]]:
             # Strip X_ prefix for connectors
             bare = re.sub(r"^X_", "", desig)
             entries.append({"raw": line, "designator": desig, "nodes": nodes, "value": value})
-            netted.add(bare)
+            if "?" not in " ".join(nodes + [value]):
+                netted.add(bare)
             continue
 
     return entries, netted
+
+
+def _resolved_designators(entries: list[dict]) -> set[str]:
+    return {
+        re.sub(r"^[QX]_", "", entry["designator"]) for entry in entries
+        if "?" not in " ".join(entry["nodes"] + [entry["value"]])
+    }
+
+
+def _scope_spice_entries(entries: list[dict], scope: str, tile: bool = False) -> list[dict]:
+    result = []
+    for entry in entries:
+        nodes = [
+            "{}_{}{}".format(scope, node.rstrip("?"), "?" if tile or "?" in node else "")
+            if re.fullmatch(r"n\d+\??", node, re.IGNORECASE) else node
+            for node in entry["nodes"]
+        ]
+        result.append(dict(entry, nodes=nodes, raw="{} {} {}".format(
+            entry["designator"], " ".join(nodes), entry["value"],
+        )))
+    return result
+
+
+def _merge_spice_entries(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    merged = {re.sub(r"^[QX]_", "", entry["designator"]): entry for entry in existing}
+    for entry in incoming:
+        designator = re.sub(r"^[QX]_", "", entry["designator"])
+        previous = merged.get(designator)
+        if previous and _resolved_designators([previous]):
+            if not _resolved_designators([entry]):
+                continue
+            if previous["nodes"] != entry["nodes"] or previous["value"] != entry["value"]:
+                nodes = [node.rstrip("?") + "?" for node in entry["nodes"]]
+                entry = dict(entry, nodes=nodes, raw="{} {} {}".format(
+                    entry["designator"], " ".join(nodes), entry["value"],
+                ))
+        merged[designator] = entry
+    return list(merged.values())
 
 
 def _spice_entries_to_standalone_json(entries: list[dict], board_id: str, manual_name: str) -> dict:
@@ -1035,14 +1235,24 @@ def _spice_to_circuit_json(entries: list[dict], circuit_data: dict) -> dict:
     # Build node -> [(componentID, pinID)] mapping from SPICE entries
     node_map: dict[str, list[tuple[str, str]]] = {}
 
+    circuit_data = json.loads(json.dumps(circuit_data))
+    generated = _spice_entries_to_standalone_json(entries, "", "")
+    components = circuit_data.setdefault("components", [])
+    existing = {component["designator"].upper() for component in components}
+    components.extend(component for component in generated["components"] if component["designator"].upper() not in existing)
+
     # Map of component designators to their pin info from circuit_data
     comp_pins = {}
     for c in circuit_data.get("components", []):
         comp_pins[c["designator"].upper()] = [p["id"] for p in c.get("pins", [])]
+        for pin in c.get("pins", []):
+            pin["netID"] = ""
 
     for entry in entries:
         bare = re.sub(r"^[QX]_", "", entry["designator"])
         pins = comp_pins.get(bare, [])
+        if len(entry["nodes"]) == 3 and set(pins) == {"C", "B", "E"}:
+            pins = ["C", "B", "E"]
 
         for i, node_name in enumerate(entry["nodes"]):
             # Determine pin ID — use known pins if available, else positional
@@ -1052,6 +1262,11 @@ def _spice_to_circuit_json(entries: list[dict], circuit_data: dict) -> dict:
                 pin_id = str(i + 1)
 
             node_map.setdefault(node_name, []).append((bare, pin_id))
+            for component in components:
+                if component["designator"].upper() == bare:
+                    for pin in component.get("pins", []):
+                        if pin["id"] == pin_id:
+                            pin["netID"] = node_name
 
     # Build nets array
     nets = []
@@ -1071,14 +1286,14 @@ def _spice_to_circuit_json(entries: list[dict], circuit_data: dict) -> dict:
 
 
 @mcp.tool()
-def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int = 0) -> str:
+def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int = 0, refresh: bool = False) -> str:
     """Cross-check a schematic against its parts list to find unreadable components.
 
     Extracts component designators from the parts list and the schematic using
     vision, compares the two, then automatically crops the schematic into
     higher-resolution tiles and re-scans for any missing designators. Repeats
-    with progressively finer grids until coverage reaches 95% or no further
-    improvement is found.
+    with overlapping grids and bounded stronger-model retries. Readings are
+    cached with source hashes; confirmed labels do not verify connectivity.
 
     Requires ANTHROPIC_API_KEY environment variable.
 
@@ -1088,17 +1303,20 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
         board_id: Board assembly ID (e.g. 'P800', 'AWH-046').
         parts_list_page: PDF page number of the parts list for this board.
                          0 = auto-detect by scanning all parts list pages.
+        refresh: Ignore cached readings and recheck the source images.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return "Error: ANTHROPIC_API_KEY not set. Required for vision analysis."
 
     manual_dir = _find_manual_dir(manual_name)
     if not manual_dir:
         return "Manual '{}' not found. Use list_manuals to see available manuals.".format(manual_name)
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key) if api_key else None
     pass_log = []  # track what happened at each pass
+    schematic_images = _board_schematic_images(manual_dir, board_id)
+    if not schematic_images:
+        return "No schematic images found for board '{}'. Check the board ID.".format(board_id)
+    circuit_data = _load_circuit_json(manual_dir, board_id) or {}
 
     # --- Step 1: Extract designators from parts list ---
     parts_list_images = _find_parts_list_images(manual_dir)
@@ -1116,64 +1334,63 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
             )
         parts_list_images = match
 
-    parts_designators = set()
-    matched_pages = []
+    parts_list_images = list(dict.fromkeys(parts_list_images))
+    sources = _source_fingerprints(schematic_images + parts_list_images)
+    cache = {} if refresh else _cached_readings(circuit_data, schematic_images)
+    if cache.get("sources") != sources or cache.get("partsListPage") != parts_list_page or not cache.get("partsComplete"):
+        cache = {}
+    parts_designators = set(cache.get("partsDesignators", []))
+    matched_pages = list(cache.get("matchedPages", []))
+    parts_complete = True
+    if not cache and client is None:
+        return "Error: ANTHROPIC_API_KEY not set. Required to read uncached parts lists."
 
-    for pl_path in parts_list_images:
+    for pl_path in ([] if cache else parts_list_images):
         try:
             img_data, _, _ = _image_to_base64(pl_path)
-        except Exception:
+        except Exception as exc:
+            parts_complete = False
+            pass_log.append("Parts list {}: {}".format(pl_path.name, exc))
             continue
 
-        prompt = _EXTRACT_PARTS_LIST_PROMPT.format(board_id.upper(), board_id.upper())
+        prompt = _EXTRACT_PARTS_LIST_PROMPT.format(board_id.upper(), board_id.upper()) + _page_text_context(pl_path)
         try:
             result = _vision_call(client, [(img_data, "image/jpeg")], prompt, max_tokens=2048)
-        except Exception:
+        except Exception as exc:
+            parts_complete = False
+            pass_log.append("Parts list {}: {}".format(pl_path.name, exc))
             continue
 
         if "NO_MATCH" in result:
             continue
 
         matched_pages.append(pl_path.name)
-        for line in result.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or line.startswith("*"):
-                continue
-            upper = line.upper()
-            if board_id.upper() in upper and not re.match(r"^[A-Z]\d", upper):
-                continue
-            if re.match(r"^[A-Z]+\d", upper):
-                parts_designators.add(upper)
+        confirmed, uncertain = _parse_designator_lines(result)
+        if uncertain or not confirmed:
+            parts_complete = False
+        parts_designators |= confirmed
 
     if not parts_designators:
         return "Could not find parts for board '{}' in {} parts list page(s). Try specifying parts_list_page.".format(
             board_id, len(parts_list_images),
-        )
-
-    # --- Step 2: Collect schematic images for this board ---
-    board_id_upper = board_id.upper().strip()
-    schematic_images = []
-    for f in sorted(manual_dir.glob("*.md")):
-        if f.name == "_index.md":
-            continue
-        text = f.read_text(encoding="utf-8")
-        if board_id_upper not in text.upper():
-            continue
-        if re.search(r"parts.list", f.name, re.IGNORECASE):
-            continue
-        for img_name in _extract_image_refs(text):
-            img_path = manual_dir / img_name
-            if img_path.exists():
-                schematic_images.append(img_path)
-
-    if not schematic_images:
-        return "No schematic images found for board '{}'. Check the board ID.".format(board_id)
+        ) + "\n" + "\n".join(pass_log)
 
     # --- Pass 1: Full image scan ---
-    schematic_designators = set()
-    uncertain_designators = set()
+    readings = cache.get("designators", {})
+    schematic_designators = {name for name, entry in readings.items() if entry["status"] == "confirmed"}
+    uncertain_designators = set(cache.get("uncertainReadings", []))
+    pass_log.append("Reused {} cached confirmed labels.".format(len(schematic_designators)))
+    for sch_path in schematic_images:
+        for designator, evidence in _native_designators(sch_path).items():
+            for source in evidence:
+                _record_readings(readings, {designator}, set(), parts_designators, source)
+            schematic_designators.add(designator)
+    pass_log.append("Cache + visible PDF text: {} labels found.".format(len(schematic_designators)))
 
     for sch_path in schematic_images:
+        missing = parts_designators - schematic_designators
+        if not missing or client is None:
+            break
         try:
             img_data, _, _ = _image_to_base64(sch_path)
         except Exception:
@@ -1181,11 +1398,15 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
         try:
             result = _vision_call(
                 client, [(img_data, "image/jpeg")],
-                _EXTRACT_SCHEMATIC_DESIGNATORS_PROMPT, max_tokens=4096,
+                _TARGETED_DESIGNATOR_PROMPT.format("\n".join(sorted(missing))), max_tokens=4096,
             )
-        except Exception:
+        except Exception as exc:
+            pass_log.append("Full image {}: {}".format(sch_path.name, exc))
             continue
         confirmed, uncertain = _parse_designator_lines(result)
+        _record_readings(readings, confirmed, uncertain, parts_designators, {
+            "image": sch_path.name, "bbox": [0, 0, 1, 1], "source": "vision", "model": VISION_MODEL,
+        })
         schematic_designators |= confirmed
         uncertain_designators |= uncertain
 
@@ -1196,32 +1417,40 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
     ))
 
     # --- Pass 2+: Progressive higher-resolution tile crops ---
-    for grid in CROP_GRIDS:
-        if coverage >= COVERAGE_TARGET or not still_missing:
+    hard_calls = 0
+    passes = [(grid, False) for grid in CROP_GRIDS] + [(CROP_GRIDS[-1], True)]
+    for grid, hard in passes:
+        if coverage >= COVERAGE_TARGET or not still_missing or client is None:
             break
+        model = HARD_VISION_MODEL if hard else VISION_MODEL
 
         newly_found = set()
         grid_label = "{}x{}".format(grid[0], grid[1])
 
         for sch_path in schematic_images:
             try:
-                tiles = _crop_image_tiles(sch_path, grid)
+                tiles = list(_refinement_tiles(sch_path, grid, still_missing, readings, hard=hard))
             except Exception:
                 continue
 
-            for tile_data in tiles:
-                if not still_missing:
+            for _, tile_images, evidence in tiles:
+                if not still_missing or (hard and hard_calls >= _hard_call_budget()):
                     break
 
                 prompt = _TARGETED_DESIGNATOR_PROMPT.format(
                     "\n".join(sorted(still_missing)),
                 )
+                if hard:
+                    hard_calls += 1
+                    prompt += "\nImages show the same region: original first, enhanced second. Do not infer invisible labels."
                 try:
-                    result = _vision_call(client, [tile_data], prompt, max_tokens=2048)
-                except Exception:
+                    result = _vision_call(client, tile_images, prompt, max_tokens=2048, model=model)
+                except Exception as exc:
+                    pass_log.append("{} crop: {}".format(model, exc))
                     continue
 
                 confirmed, uncertain = _parse_designator_lines(result)
+                _record_readings(readings, confirmed, uncertain, parts_designators, evidence)
                 for d in confirmed:
                     if d in still_missing:
                         schematic_designators.add(d)
@@ -1230,16 +1459,36 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
                 uncertain_designators |= uncertain
 
         coverage = _compute_coverage(parts_designators, schematic_designators)
-        pass_log.append("Pass {} ({} crop): +{} new ({}), coverage {:.0f}%".format(
-            len(pass_log) + 1, grid_label, len(newly_found),
+        pass_log.append("Pass {} ({} crop, {}): +{} new ({}), coverage {:.0f}%".format(
+            len(pass_log) + 1, grid_label, model, len(newly_found),
             ", ".join(sorted(newly_found)) if newly_found else "none",
             coverage,
         ))
 
-        # Stop if no improvement — finer grid won't help
-        if not newly_found:
-            pass_log.append("No improvement — stopping crop passes.")
-            break
+    pass_log.append("Stronger-model calls: {}/{}".format(hard_calls, _hard_call_budget()))
+    for designator in parts_designators:
+        readings.setdefault(designator, {"status": "missing", "evidence": []})
+    if not parts_complete:
+        pass_log.append("Parts list extraction was incomplete; coverage is provisional and the baseline will be retried.")
+    circuit_data.setdefault("name", "{} ({})".format(board_id, manual_dir.name))
+    for field in ("components", "nets", "functionalBlocks"):
+        circuit_data.setdefault(field, [])
+    circuit_data["schematicReadings"] = {
+        "version": 1, "updatedAt": datetime.now().astimezone().isoformat(),
+        "settings": _reading_settings(), "sources": sources,
+        "schematicImages": [path.name for path in schematic_images],
+        "partsListPage": parts_list_page, "partsDesignators": sorted(parts_designators),
+        "partsComplete": parts_complete,
+        "matchedPages": matched_pages, "designators": readings,
+        "uncertainReadings": sorted(uncertain_designators),
+    }
+    try:
+        _save_circuit_json(manual_dir, board_id, circuit_data)
+        pass_log.append("Saved per-designator readings and source hashes to circuit JSON.")
+    except OSError as exc:
+        pass_log.append("Could not save readings: {}".format(exc))
+    if client is None and still_missing:
+        pass_log.append("ANTHROPIC_API_KEY not set; unresolved readings need a vision retry.")
 
     # --- Final cross-reference ---
     found = parts_designators & schematic_designators
@@ -1250,8 +1499,7 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
     for m in remaining_missing:
         matched = False
         for u in uncertain_designators:
-            pattern = u.replace("?", ".")
-            if re.fullmatch(pattern, m):
+            if _matches_uncertain(u, m):
                 maybe_found.add("{} (possibly read as {})".format(m, u))
                 matched = True
                 break
@@ -1301,12 +1549,12 @@ def cross_check_schematic(manual_name: str, board_id: str, parts_list_page: int 
         lines.append("")
 
     if coverage >= COVERAGE_TARGET:
-        lines.append("**Verdict**: Coverage target met ({:.0f}% >= {}%). All key components accounted for.".format(
+        lines.append("**Verdict**: Label coverage target met ({:.0f}% >= {}%). Values and connections still need verification.".format(
             coverage, COVERAGE_TARGET,
         ))
     else:
         lines.append("**Verdict**: {:.0f}% coverage after all passes. {} designator(s) remain unreadable — these may require manual inspection of the original PDF.".format(
-            coverage, len(still_missing_final),
+            coverage, len(remaining_missing),
         ))
 
     return "\n".join(lines)
@@ -1360,26 +1608,23 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
     else:
         _progress("No existing circuit data — will create from scratch")
 
-    # Collect schematic images for this board
-    board_id_upper = board_id.upper().strip()
-    schematic_images = []
-    for f in sorted(manual_dir.glob("*.md")):
-        if f.name == "_index.md":
-            continue
-        text = f.read_text(encoding="utf-8")
-        if board_id_upper not in text.upper():
-            continue
-        if re.search(r"parts.list", f.name, re.IGNORECASE):
-            continue
-        for img_name in _extract_image_refs(text):
-            img_path = manual_dir / img_name
-            if img_path.exists():
-                schematic_images.append(img_path)
+    schematic_images = _board_schematic_images(manual_dir, board_id)
 
     if not schematic_images:
         return "No schematic images found for board '{}'. Check the board ID.".format(board_id)
 
     _progress("Found {} schematic image(s) for {}".format(len(schematic_images), board_id))
+    cache = _cached_readings(circuit_data, schematic_images)
+    readings = cache.get("designators", {})
+    for sch_path in schematic_images:
+        for designator, evidence in _native_designators(sch_path).items():
+            for source in evidence:
+                _record_readings(readings, {designator}, set(), set(), source)
+    known_components |= set(cache.get("partsDesignators", [])) | set(readings)
+    if readings:
+        label_context = "\n".join("{}: {}".format(name, entry["status"]) for name, entry in sorted(readings.items()))
+        theory_context += "\nPrior label readings (not verified connections):\n" + label_context
+        pass_log.append("Reused {} label readings; tracing connections independently.".format(len(readings)))
 
     # --- Pass 1: Full image netlist extraction ---
     _progress("Step 2/4: Pass 1 — analyzing full schematic image(s)...")
@@ -1390,24 +1635,27 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
         _progress("Pass 1: Analyzing image {}/{} ({})...".format(i + 1, len(schematic_images), sch_path.name))
         try:
             img_data, _, _ = _image_to_base64(sch_path)
+            original_data, _, _ = _image_to_base64(sch_path, enhance=False)
         except Exception:
             continue
 
-        prompt = _NETLIST_EXTRACTION_PROMPT.format(theory_context)
+        prompt = _NETLIST_EXTRACTION_PROMPT.format(theory_context) + _page_text_context(sch_path)
+        prompt += "\nImages show the same page: original first, enhanced second. Only trace visible wires, not expected circuit topology."
         try:
-            result = _vision_call(client, [(img_data, "image/jpeg")], prompt, max_tokens=4096)
+            result = _vision_call(client, [(original_data, "image/jpeg"), (img_data, "image/jpeg")], prompt, max_tokens=4096)
         except Exception as exc:
             pass_log.append("Pass 1: Vision error on {}: {}".format(sch_path.name, exc))
             _progress("Pass 1: Vision error on {}: {}".format(sch_path.name, exc))
             continue
 
         entries, netted = _parse_spice_lines(result)
-        all_entries.extend(entries)
-        netted_designators |= netted
+        all_entries = _merge_spice_entries(all_entries, _scope_spice_entries(entries, "p{}".format(i + 1)))
+        netted_designators = _resolved_designators(all_entries)
         _progress("Pass 1: Found {} connections so far".format(len(all_entries)))
 
+    known_components |= {re.sub(r"^[QX]_", "", entry["designator"]) for entry in all_entries}
     coverage = _compute_coverage(known_components, netted_designators) if known_components else 0
-    still_missing = known_components - netted_designators if known_components else set()
+    still_missing = known_components - netted_designators
     pass1_msg = "Pass 1 (full image): netted {}/{} components, coverage {:.0f}%".format(
         len(known_components & netted_designators) if known_components else len(netted_designators),
         len(known_components) if known_components else "?",
@@ -1418,24 +1666,28 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
 
     # --- Pass 2+: Progressive tile crop refinement ---
     _progress("Step 3/4: Tile refinement passes ({} missing)...".format(len(still_missing)))
-    for grid_idx, grid in enumerate(CROP_GRIDS):
+    hard_calls = 0
+    passes = [(grid, False) for grid in CROP_GRIDS] + [(CROP_GRIDS[-1], True)]
+    for grid_idx, (grid, hard) in enumerate(passes):
         if coverage >= COVERAGE_TARGET or not still_missing:
             _progress("Coverage target met or no missing components — skipping tile passes")
             break
 
         newly_found = set()
+        model = HARD_VISION_MODEL if hard else VISION_MODEL
         grid_label = "{}x{}".format(grid[0], grid[1])
         _progress("Pass {} ({} crop): scanning for {} missing components...".format(
             grid_idx + 2, grid_label, len(still_missing)))
 
-        for sch_path in schematic_images:
+        for image_index, sch_path in enumerate(schematic_images, 1):
             try:
-                tiles = _crop_image_tiles(sch_path, grid)
+                tiles = list(_refinement_tiles(sch_path, grid, still_missing, readings, hard=hard))
+                overview_data, _, _ = _image_to_base64(sch_path, enhance=False)
             except Exception:
                 continue
 
-            for tile_idx, tile_data in enumerate(tiles):
-                if not still_missing:
+            for tile_idx, tile_images, evidence in tiles:
+                if not still_missing or (hard and hard_calls >= _hard_call_budget()):
                     break
 
                 _progress("Pass {} tile {}/{}: {} still missing...".format(
@@ -1443,59 +1695,68 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
                 prompt = _TARGETED_NET_PROMPT.format(
                     "\n".join(sorted(still_missing)),
                 )
+                prompt += "\nFirst image: full original page. Remaining images: the target crop"
+                prompt += " (original then enhanced)." if hard else " (enhanced)."
+                prompt += "\nCrop bounds in normalized original-page coordinates: {}".format(evidence["bbox"])
+                prompt += "\nExisting net names (reuse only when visibly connected):\n" + "\n".join(
+                    entry["raw"] for entry in all_entries if _resolved_designators([entry])
+                )
+                prompt += "\nNew anonymous crop-local nodes must have a ? suffix; their global connection is unresolved."
+                if hard:
+                    hard_calls += 1
                 try:
-                    result = _vision_call(client, [tile_data], prompt, max_tokens=2048)
-                except Exception:
+                    result = _vision_call(client, [(overview_data, "image/jpeg")] + tile_images, prompt, max_tokens=2048, model=model)
+                except Exception as exc:
+                    pass_log.append("{} crop: {}".format(model, exc))
                     continue
 
                 entries, netted = _parse_spice_lines(result)
+                entries = _scope_spice_entries(entries, "p{}_g{}_t{}".format(image_index, grid_idx, tile_idx), tile=True)
                 for entry in entries:
                     bare = re.sub(r"^[QX]_", "", entry["designator"])
                     if bare in still_missing:
-                        all_entries.append(entry)
-                        netted_designators.add(bare)
-                        still_missing.discard(bare)
-                        newly_found.add(bare)
+                        all_entries = _merge_spice_entries(all_entries, [entry])
+                        if _resolved_designators([entry]):
+                            netted_designators.add(bare)
+                            still_missing.discard(bare)
+                            newly_found.add(bare)
 
         coverage = _compute_coverage(known_components, netted_designators)
-        pass_msg = "Pass {} ({} crop): +{} new ({}), coverage {:.0f}%".format(
-            len(pass_log) + 1, grid_label, len(newly_found),
+        pass_msg = "Pass {} ({} crop, {}): +{} new ({}), coverage {:.0f}%".format(
+            len(pass_log) + 1, grid_label, model, len(newly_found),
             ", ".join(sorted(newly_found)) if newly_found else "none",
             coverage,
         )
         pass_log.append(pass_msg)
         _progress(pass_msg)
 
-        if not newly_found:
-            pass_log.append("No improvement — stopping crop passes.")
-            _progress("No improvement — stopping crop passes.")
-            break
+    pass_log.append("Stronger-model calls: {}/{}".format(hard_calls, _hard_call_budget()))
 
     # --- Save updated JSON ---
     _progress("Step 4/4: Saving circuit JSON...")
     json_saved = False
-    if save_json and all_entries:
+    resolved_entries = [entry for entry in all_entries if _resolved_designators([entry])]
+    if save_json and resolved_entries:
         try:
             if circuit_data:
-                updated = _spice_to_circuit_json(all_entries, circuit_data)
+                updated = _spice_to_circuit_json(resolved_entries, circuit_data)
             else:
                 # No pre-existing circuit — build a minimal one from SPICE entries
-                updated = _spice_entries_to_standalone_json(all_entries, board_id, manual_dir.name)
-            circuits_dir = manual_dir / "_circuits"
-            circuits_dir.mkdir(exist_ok=True)
-            out_path = circuits_dir / "{}.json".format(_safe_filename(board_id.upper()))
-            out_path.write_text(json.dumps(updated, indent=2, ensure_ascii=False), encoding="utf-8")
+                updated = _spice_entries_to_standalone_json(resolved_entries, board_id, manual_dir.name)
+            out_path = _save_circuit_json(manual_dir, board_id, updated)
             json_saved = True
             _progress("Saved circuit JSON: {}".format(out_path.name))
         except Exception as exc:
+            pass_log.append("Could not save circuit JSON: {}".format(exc))
             _progress("Error saving JSON: {}".format(exc))
 
     # --- Build SPICE output ---
     spice_lines = ["* SPICE Netlist: {} ({})".format(board_id, manual_dir.name)]
     spice_lines.append("* Generated by service-manual-reader vision analysis")
+    spice_lines.append("* DRAFT: verify values, pin identities, and junctions against the original before use.")
     spice_lines.append("*")
     for entry in all_entries:
-        spice_lines.append(entry["raw"])
+        spice_lines.append(entry["raw"] if _resolved_designators([entry]) else "* UNRESOLVED: " + entry["raw"])
     spice_lines.append(".END")
     spice_text = "\n".join(spice_lines)
 
@@ -1509,6 +1770,7 @@ def generate_netlist(manual_name: str, board_id: str, save_json: bool = True) ->
     report.append("")
 
     report.append("## Summary")
+    report.append("Draft connectivity only. Cached label confidence is not electrical verification.")
     report.append("- Components in circuit data: **{}**".format(len(known_components) if known_components else "N/A"))
     report.append("- Components with connections traced: **{}**".format(len(netted_designators)))
     report.append("- Final coverage: **{:.0f}%**".format(coverage))

@@ -37,7 +37,7 @@ process.launch()
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `extract_manual` | `pdf_path: String` | Status message. Extracts PDF → `~/Claude-Manuals/<name>/` |
+| `extract_manual` | `pdf_path: String` | Status message. Extracts PDF → `/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics/<name>/` |
 | `list_manuals` | — | List of extracted manual names |
 | `search_service_manual` | `brand: String, model: String` | Web search results with download links |
 | `download_service_manual` | `url: String, brand: String = "", model: String = "", filename: String = ""` | Downloads PDF to `/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics/<Brand Model>/` and returns path for `extract_manual` |
@@ -56,14 +56,20 @@ process.launch()
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `analyze_schematic` | `manual_name: String, board_id: String, page: Int` | Natural language circuit analysis (components, signal path, power rails) |
-| `cross_check_schematic` | `manual_name: String, board_id: String, parts_list_page: Int = 0` | Coverage report — compares parts list vs schematic, auto-crops for missing components |
+| `cross_check_schematic` | `manual_name: String, board_id: String, parts_list_page: Int = 0, refresh: Bool = false` | Label coverage report, overlapping crops, bounded stronger-model retries, and persisted source-validated readings |
 | `generate_netlist` | `manual_name: String, board_id: String, save_json: Bool = true` | SPICE netlist + updates `_circuits/<board_id>.json` with traced connectivity |
 
 ## Data Model — `_circuits/<board_id>.json`
 
+An optional `schematicReadings` object stores per-designator `status` (`confirmed`, `uncertain`, `missing`), evidence (image filename, normalized original-image crop bounds, source, and vision model when applicable), source hashes, and processing settings. `confirmed` means read without an uncertainty marker, not technician-verified. These readings do not certify connectivity. Existing component metadata is preserved when saving readings; netlist generation excludes unresolved connections from saved nets.
+
+PDF extraction also writes `.text.json` sidecars alongside page images. These contain positioned words and distinguish visible text from hidden OCR. Old extractions remain readable without sidecars; re-extract them for text-assisted vision.
+
+Vision models, preprocessing, and hard-call budgets are configurable through the `SCHEMATIC_*` environment variables documented in [readme.md](readme.md#reading-difficult-scans).
+
 This is the primary data file for 3D assembly rendering. Located at:
 ```
-~/Claude-Manuals/<manual-name>/_circuits/<BOARD_ID>.json
+/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics/<manual-name>/_circuits/<BOARD_ID>.json
 ```
 
 ### Schema

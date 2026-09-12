@@ -62,15 +62,19 @@
 					<string>export PATH="/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$PATH"
 
 SCRIPT_DIR="$HOME/Desktop/Code/service-manual-reader"
-OUTPUT_DIR="$HOME/Claude-Manuals"
+OUTPUT_DIR="/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics"
+PYTHON="$SCRIPT_DIR/mcp-server/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+	PYTHON="python3"
+fi
 
 for f in "$@"; do
     if [[ "$f" == *.pdf ]] || [[ "$f" == *.PDF ]]; then
-        python3 "$SCRIPT_DIR/convert.py" "$f" --output-dir "$OUTPUT_DIR"
+		"$PYTHON" "$SCRIPT_DIR/convert.py" "$f" --output-dir "$OUTPUT_DIR"
     fi
 done
 
-osascript -e 'display notification "Manual extracted to ~/Claude-Manuals/" with title "Extract for Claude" sound name "Glass"'</string>
+osascript -e 'display notification "Manual extracted to Benchmark Audio Repair/Schematics" with title "Extract for Claude" sound name "Glass"'</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>

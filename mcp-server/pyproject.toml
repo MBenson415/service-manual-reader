@@ -10,4 +10,6 @@ dependencies = [
     "mcp[cli]>=1.26.0",
     "pillow>=11.0.0",
     "pymupdf>=1.27.1",
+    "numpy>=2.0.0",
+    "opencv-python-headless>=4.10.0",
 ]

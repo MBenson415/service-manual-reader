@@ -9,14 +9,22 @@ Produces:
 
 import argparse
 import base64
+import hashlib
+import json
 import os
 import re
 import sys
 from collections import Counter, defaultdict
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 import fitz  # PyMuPDF
+from PIL import Image
+
+from schematic_imaging import preprocess_image
+
+DEFAULT_OUTPUT_DIR = Path("/Users/marshallbenson/Desktop/Benchmark Audio Repair/Schematics")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -221,7 +229,7 @@ def sections_fallback(doc: fitz.Document, watermarks: set, chunk: int = 30) -> l
 # Vision-based section detection (for scanned / image-only PDFs)
 # ---------------------------------------------------------------------------
 
-VISION_MODEL = "claude-haiku-4-5-20251001"
+VISION_MODEL = os.environ.get("SCHEMATIC_VISION_MODEL", "claude-haiku-4-5-20251001")
 VISION_BATCH = 4          # pages per API call
 VISION_DPI   = 120        # lower DPI for efficient API transfer
 SPARSE_THRESHOLD = 0.80   # trigger vision when >= this fraction are image pages
@@ -253,7 +261,11 @@ def _render_page_jpeg(doc: fitz.Document, page_num: int) -> bytes:
         zoom = zoom * (VISION_MAX_PX / longest)
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-    return pix.tobytes(output="jpeg", jpg_quality=70)
+    image = preprocess_image(Image.frombytes("L", (pix.width, pix.height), pix.samples))
+    image.thumbnail((VISION_MAX_PX, VISION_MAX_PX), Image.Resampling.LANCZOS)
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return buffer.getvalue()
 
 
 _VISION_PROMPT = (
@@ -476,7 +488,26 @@ def extract_page_image(
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
     filename = "{}.png".format(image_name)
-    pix.save(str(out_dir / filename))
+    image_path = out_dir / filename
+    pix.save(str(image_path))
+    visible_spans = [fitz.Rect(span["bbox"]) for span in page.get_texttrace() if span["type"] != 3]
+    words = []
+    for word in page.get_text("words", sort=True):
+        original_box = fitz.Rect(word[:4])
+        center = (original_box.tl + original_box.br) / 2
+        box = original_box * page.rotation_matrix
+        words.append({
+            "text": word[4],
+            "bbox": [box.x0 / page.rect.width, box.y0 / page.rect.height,
+                     box.x1 / page.rect.width, box.y1 / page.rect.height],
+            "visible": any(center in span for span in visible_spans),
+        })
+    metadata = {
+        "version": 1, "page": page_num + 1,
+        "image_sha256": hashlib.sha256(image_path.read_bytes()).hexdigest(),
+        "words": words,
+    }
+    image_path.with_suffix(".text.json").write_text(json.dumps(metadata), encoding="utf-8")
     return filename
 
 
@@ -622,7 +653,7 @@ def write_section(
         cleaned = clean_text(text)
         is_image = page_num < len(page_classes) and page_classes[page_num] == "image"
 
-        if is_image:
+        if is_image or section_type in {"schematic", "parts-list", "adjustment", "exploded-view"}:
             img_name = make_image_name(slug, page_num, section_type, page_idx)
             img_file = extract_page_image(doc, page_num, out_dir, img_name, dpi)
             image_files.append(img_file)
@@ -632,7 +663,7 @@ def write_section(
             parts.append("![{} — page {}]({})".format(title, page_num + 1, img_file))
             if cleaned.strip():
                 parts.append("")
-                parts.append(cleaned)
+                parts.append(try_format_as_table(cleaned) if section_type == "parts-list" else cleaned)
             parts.append("")
         elif cleaned.strip():
             parts.append("---")
@@ -739,9 +770,9 @@ def convert_pdf(pdf_path: str, output_dir: Optional[str] = None):
     safe_name = slugify(manual_name) or "manual"
 
     if output_dir:
-        out = Path(output_dir).resolve() / safe_name
+        out = Path(output_dir).expanduser().resolve() / safe_name
     else:
-        out = pdf_path.parent / "manuals" / safe_name
+        out = DEFAULT_OUTPUT_DIR / safe_name
     out.mkdir(parents=True, exist_ok=True)
 
     print("Opening: {}".format(pdf_path))
@@ -809,7 +840,7 @@ def main():
     parser.add_argument("pdf", help="Path to the PDF file")
     parser.add_argument(
         "--output-dir", "-o",
-        help="Output directory (default: ./manuals/ next to the PDF)",
+        help="Output directory (default: {})".format(DEFAULT_OUTPUT_DIR),
     )
     args = parser.parse_args()
     convert_pdf(args.pdf, args.output_dir)
